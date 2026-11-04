@@ -120,7 +120,7 @@ TLS 수신 또는 같은 Pod sidecar의 루프백 수신 경로, NetworkPolicy, 
 | `ADMIN_TOKEN` | 쓰기 차단 API 토큰. 없으면 API가 꺼진다(404) |
 | `WRITE_BLOCKED` | 시작할 때 쓰기 차단 상태 (`true`/`false`) |
 | `ATTACHMENT_UPLOAD_ENABLED` | 새 첨부 업로드 허용. 기본 `true`, 이전 복사 전 모든 serving 파드에 `false` 적용. 소문자 `true`/`false` 외에는 시작 실패 |
-| `POLL_INTERVAL` · `TX_TIMEOUT_MS` · `WRITE_BLOCK_RETRY_AFTER` | 전파 주기(1초) · 쓰기 트랜잭션 제한(200ms) · `Retry-After`(2초) |
+| `POLL_INTERVAL` · `TX_TIMEOUT_MS` · `WRITE_BLOCK_RETRY_AFTER` | 전파 주기(1초) · 쓰기 SQL별 `statement_timeout`(200ms) · `Retry-After`(2초) |
 | `DB_WAIT_SECONDS` | 연결 풀에서 연결을 기다리는 최대 시간(5초). 넘으면 503 |
 
 ## API
@@ -218,3 +218,29 @@ DB와 객체 저장소 사이에 분산 트랜잭션은 없다. 객체 생성 �
 
 근거: [AWS S3 조건부 쓰기](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html),
 [버킷 정책으로 조건부 쓰기 강제](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html).
+
+## 메시지 저장의 왕복 감소와 안전 조건
+
+[T18 #171](https://github.com/Softbank-Hackathon-Finals/platform/pull/171)의
+`3r-pipeline-reads` 제안을 T22 저장 경로에 적용한다. 메시지 쓰기는 같은 transaction advisory lock을
+얻은 뒤 ID를 할당한다. 잠금을 제거하거나 INSERT 후에 잠금을 잡지 않는다.
+
+- `psycopg` pipeline에 timeout 설정·잠금·INSERT·저장 결과 조회를 순서대로 보낸다.
+  autocommit 연결의 pipeline 종료 Sync에서 함께 커밋한 뒤에만 성공을 반환한다.
+  중간 SQL 오류는 같은 묶음의 INSERT도 취소한다.
+- 읽기는 한 SELECT만 수행한다. 풀에 연결을 반환할 때 기존 autocommit 설정을 복원한다.
+- 동일 멱등 키·동일 내용은 기존 결과를 반환하고, 내용이 다르면 409다.
+  통신 취소나 응답 유실은 미커밋의 증거가 아니므로 새 키로 자동 재전송하지 않는다.
+- `TX_TIMEOUT_MS`는 **SQL별 제한**이다. 풀 대기·네트워크 왕복·전체 트랜잭션의
+  절대 상한을 보장하지 않는다. 전환 창의 PAUSE/drain 기한과 실측은 실행기에서 별도로 확인한다.
+- 저장소의 고정 `uv.lock`과 pipeline 지원 libpq(14+)를 사용한다. PgBouncer는 transaction 모드,
+  앱 연결은 `prepare_threshold=None`을 유지한다. 운영 환경의 TLS·풀 크기·왕복 지연은 별도 인수 대상이다.
+
+검증에는 독립 연결의 커밋 가시성, INSERT 이후 SQL 오류의 롤백, 잠금 대기 timeout,
+실제 잠금 대기를 확인한 뒤 취소하는 경우의 풀 복구, 강제 경쟁에서 ID/커밋 순서 보존을 포함한다.
+로컬 PostgreSQL 17의 비관리자 앱 역할로 전체 42개 시험을 통과했다. 이 결과는 실제 EKS/RKE2,
+PgBouncer TLS, 장시간 부하 또는 무중단 이전을 검증한 결과가 아니다. 추가 환경 시험은
+별도 증빙에 기록한다.
+
+동작 근거: [psycopg pipeline 문서](https://www.psycopg.org/psycopg3/docs/advanced/pipeline.html),
+[PostgreSQL pipeline transaction semantics](https://www.postgresql.org/docs/current/libpq-pipeline-mode.html).
